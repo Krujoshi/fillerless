@@ -255,14 +255,27 @@ function riskBanner() {
   if (si.count > 0 && (late || si.atRisk)) return `<div class="banner">${ico("flame")}<div><b>Your ${si.count} day streak is at risk.</b> ${Math.max(0, Math.ceil((goalSec() - secToday()) / 60))} more minutes keeps it alive.${si.freeze ? " A streak freeze will cover yesterday." : ""}</div></div>`;
   return "";
 }
+function nodeMeta(n) {
+  if (n.kind === "milestone") return "Badge";
+  if (n.kind === "read") return "Read aloud";
+  const k = { pause: "Pause drill", structure: "Structure", spot: "On the spot", speak: "Speak" }[n.kind] || "Lesson";
+  return n.targetSec ? `${k} · ${n.targetSec} s` : k;
+}
 function pathView() {
-  const cur = currentNode(); let i = 0;
-  const units = UNITS.map(u => `<section class="unit"><div class="unit-head"><span class="eyebrow">Unit ${u.id}</span><h2>${esc(u.title)}</h2><span class="small">${esc(u.blurb)}</span></div><div class="nodes">${u.nodes.map(n => {
-    const done = isDone(n.id), unl = isUnlocked(n.id), isCur = n.id === cur.id, off = Math.round(Math.sin(i++ * 0.95) * 62), p = S.progress[n.id] || {};
-    const stars = p.stars ? "★".repeat(p.stars) + "☆".repeat(3 - p.stars) : "";
-    return `<div class="node ${done ? "done" : ""} ${unl ? "" : "locked"} ${isCur ? "current" : ""}" style="transform:translateX(${off}px)">${isCur ? '<span class="start-pill">START</span>' : ""}
-      <button data-act="open" data-id="${n.id}" aria-label="${esc(n.title)}${unl ? "" : " (locked)"}"><span class="orb">${ico(done ? "check" : unl ? n.kind : "lock")}</span></button><span class="label">${esc(n.title)}</span><span class="stars" aria-hidden="true">${stars}</span></div>`;
-  }).join("")}</div></section>`).join("");
+  const cur = currentNode(); let pi = 0;
+  const units = UNITS.map(u => {
+    const doneN = u.nodes.filter(n => isDone(n.id)).length, last = u.nodes.length - 1;
+    const items = u.nodes.map((n, k) => {
+      const done = isDone(n.id), unl = isUnlocked(n.id), isCur = n.id === cur.id, p = S.progress[n.id] || {}, idx = pi++;
+      const stars = p.stars ? "★".repeat(p.stars) + "☆".repeat(3 - p.stars) : "";
+      const rail = done ? "full" : isCur ? "half" : "";
+      const sub = done && stars ? `${esc(nodeMeta(n))} · <span class="stars" aria-hidden="true">${stars}</span>` : esc(nodeMeta(n));
+      return `<li class="${done ? "done" : ""} ${unl ? "" : "locked"} ${isCur ? "current" : ""} ${k === last ? "last" : ""}" style="--c:var(--p${idx % 6 + 1})"><span class="rail ${rail}"></span>
+        <button class="stone s${idx % 5 + 1}" data-act="open" data-id="${n.id}" aria-label="${esc(n.title)}${done ? " (done)" : unl ? "" : " (locked)"}">${ico(done ? "check" : unl ? n.kind : "lock")}</button>
+        <div class="lab">${isCur ? '<span class="here">Up next</span>' : ""}<b>${esc(n.title)}</b><span>${sub}</span>${isCur ? `<button class="btn sm" data-act="open" data-id="${n.id}">${ico(n.kind === "milestone" ? "milestone" : "mic")} Start</button>` : ""}</div></li>`;
+    }).join("");
+    return `<section class="unit"><div class="unit-head"><span class="eyebrow">Unit ${u.id} · ${doneN} of ${u.nodes.length} done</span><h2>${esc(u.title)}</h2><span class="small">${esc(u.blurb)}</span><span class="ubar" aria-hidden="true"><i style="width:${Math.round(doneN / u.nodes.length * 100)}%"></i></span></div><ol class="nodes">${items}</ol></section>`;
+  }).join("");
   return `${topBar()}<div class="stack">${riskBanner()}<button class="btn" data-act="open" data-id="${cur.id}">${ico(cur.kind === "milestone" ? "milestone" : "mic")} Start today's practice: ${esc(cur.title)}</button></div>${units}`;
 }
 function spotView() {
