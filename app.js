@@ -89,17 +89,56 @@ function lcsMatch(a, b) { // returns Set of indices in a that appear in order in
   return hit;
 }
 function analyzeAudio(levels) {
-  if (!levels || levels.length < 20) return { pauses: [], startDelay: 0, ratio: 0, ok: false };
+  if (!levels || levels.length < 20) return { pauses: [], runs: [], startDelay: 0, ratio: 0, ok: false };
   const sorted = [...levels].sort((a, b) => a - b), floor = sorted[Math.floor(sorted.length * 0.2)];
   const thr = Math.max(0.012, floor * 3), sp = levels.map(v => v > thr);
   for (let i = 0; i < sp.length;) { if (sp[i]) { i++; continue; } let j = i; while (j < sp.length && !sp[j]) j++; if (j - i <= 3 && i > 0 && j < sp.length) for (let k = i; k < j; k++) sp[k] = true; i = j; }
   const first = sp.indexOf(true), last = sp.lastIndexOf(true);
-  if (first < 0) return { pauses: [], startDelay: levels.length / 10, ratio: 0, ok: true };
+  if (first < 0) return { pauses: [], runs: [], startDelay: levels.length / 10, ratio: 0, ok: true };
   const pauses = []; let i = first;
   while (i <= last) { if (sp[i]) { i++; continue; } let j = i; while (j <= last && !sp[j]) j++; if ((j - i) >= 8) pauses.push((j - i) / 10); i = j; }
-  return { pauses, startDelay: first / 10, ratio: sp.filter(Boolean).length / (last - first + 1), ok: true };
+  const runs = []; let rs = first, k = first;
+  while (k <= last) { if (sp[k]) { k++; continue; } let j = k; while (j <= last && !sp[j]) j++; if (j - k >= 6) { runs.push((k - rs) / 10); rs = j; } k = j; }
+  runs.push((last + 1 - rs) / 10);
+  return { pauses, runs, startDelay: first / 10, ratio: sp.filter(Boolean).length / (last - first + 1), ok: true };
 }
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/* ---------- sentence framing and authority ---------- */
+const WEAK = [
+  ["i was wondering if", "hedge", "Can you / Could we"], ["i think we should", "hedge", "I recommend we"], ["maybe we could", "hedge", "I propose we"], ["maybe we should", "hedge", "I propose we"],
+  ["i feel like", "hedge", "I believe"], ["i'm not sure but", "hedge", "My view is"], ["it seems like", "hedge", "I see that"], ["we could possibly", "hedge", "we will"],
+  ["a little bit", "hedge", ""], ["to be honest", "hedge", ""], ["if that makes sense", "tag", ""], ["does that make sense", "tag", ""], ["or something", "tag", ""],
+  ["i guess", "hedge", ""], ["i think", "hedge", ""], ["sort of", "hedge", ""], ["kind of", "hedge", ""], ["hopefully", "hedge", "I expect"], ["try to", "hedge", "will"],
+  ["probably", "hedge", "likely"], ["perhaps", "hedge", ""], ["maybe", "hedge", ""], ["just", "hedge", ""], ["sorry", "apology", "thank you for your patience"], ["i'm no expert", "apology", ""], ["bear with me", "apology", ""]
+].map(([p, c, r]) => ({ toks: p.split(" "), p, c, r })).sort((x, y) => y.toks.length - x.toks.length);
+const DECISIVE = /\b(i recommend|my recommendation|we will|i will|we should|we need to|i propose|the priority is|the decision is|let's|my view is|i believe|the key (point|issue) is|we must|i suggest|the plan is)\b/g;
+function frameReview(words, out, audio, opening, close) {
+  const n = words.length, hits = []; const seen = { hedge: 0, tag: 0, apology: 0 };
+  for (let i = 0; i < n; i++) for (const w of WEAK) { if (w.toks.every((t, k) => words[i + k] === t)) { hits.push({ i, w }); seen[w.c]++; i += w.toks.length - 1; break; } }
+  const txt = " " + words.join(" ") + " ", decisive = (txt.match(DECISIVE) || []).length, hr = seen.hedge / Math.max(n / 100, 0.5);
+  const conn = words.filter(x => ["and", "so", "but", "because"].includes(x)).length / Math.max(n / 100, 0.5), longest = out.longestRun || 0;
+  let auth = 100 - Math.min(40, hr * 5) - Math.min(16, seen.apology * 8) - Math.min(15, seen.tag * 5) - Math.min(12, (out.fpm || 0) * 3) - (longest > 15 ? 8 : 0) - (out.wpm < 110 ? 6 : 0) + Math.min(12, decisive * 4);
+  auth = Math.round(clamp(auth, 0, 100));
+  let fr = (opening ? 20 : 6) + (decisive >= 2 ? 25 : decisive === 1 ? 16 : 6) + 25 * (1 - Math.min(1, hr / 6)) + ((conn <= 9 && longest <= 15) ? 20 : conn <= 12 ? 12 : 6) + (close ? 10 : 3);
+  fr = Math.round(clamp(fr, 0, 100));
+  const label = auth >= 80 ? "Authoritative" : auth >= 60 ? "Mostly confident" : auth >= 40 ? "Tentative in places" : "Hesitant";
+  const reframes = [], used = new Set();
+  const prio = { apology: 0, tag: 1, hedge: 2 };
+  [...hits].sort((p, q) => prio[p.w.c] - prio[q.w.c] || q.w.toks.length - p.w.toks.length || p.i - q.i).forEach(h => { if (reframes.length >= 4 || used.has(h.w.p) && h.w.p !== "just") return; if (used.has(h.w.p)) return; used.add(h.w.p);
+    const before = words.slice(Math.max(0, h.i - 3), h.i), mid = words.slice(h.i, h.i + h.w.toks.length), after = words.slice(h.i + h.w.toks.length, h.i + h.w.toks.length + 6);
+    reframes.push({ said: [...before, ...mid, ...after].join(" "), better: [...before, h.w.r, ...after].filter(Boolean).join(" "), cat: h.w.c, phrase: h.w.p }); });
+  const pointers = [];
+  if (hr > 3) pointers.push("Delete softeners such as 'I think', 'maybe' and 'just'. If you are not certain, say what you will check and by when, for example 'I will confirm by Friday'.");
+  if (seen.apology) pointers.push("Do not apologise for speaking. Replace 'sorry' with 'thank you for your patience' or simply start your point.");
+  if (seen.tag) pointers.push("End on your last word. Skip 'does that make sense?' and use a pause to invite questions.");
+  if (decisive < 2) pointers.push("Open key sentences with a commitment: 'I recommend...', 'We will...', 'The priority is...'.");
+  if (longest > 15) pointers.push(`Your longest stretch without a pause was ${Math.round(longest)} seconds. Aim for one idea per breath and stop at the end of each idea.`);
+  if (conn > 9) pointers.push("You chained ideas with 'and', 'so' and 'but'. Break them into separate short sentences, each with its own pause.");
+  if (out.wpm > 165) pointers.push("Slow down on your key lines. Authority sounds slower and lower, not faster.");
+  pointers.push("Finish each sentence on a falling tone, then hold a one beat pause. I cannot measure pitch yet, so check this by listening back: does your voice drop or rise at the end?");
+  return { auth, label, fr, seen, decisive, hr, conn, longest, reframes, pointers: pointers.slice(0, 4) };
+}
 
 function analyze(text, dur, audio, node, passage) {
   const isRead = node.kind === "read", words = tokens(text), n = words.length, mins = Math.max(dur / 60, 0.1);
@@ -120,6 +159,7 @@ function analyze(text, dur, audio, node, passage) {
     if (ppm < 2) out.tips.push("You barely paused. Stop for a full beat at each full stop; the silence is the skill.");
     return out;
   }
+  const runs = audio.runs || []; out.longestRun = runs.length ? Math.max(...runs) : 0;
   const fc = countFillers(text); out.fillers = fc; out.fillerCount = Object.values(fc).reduce((a, b) => a + b, 0) + out.repeats; out.fpm = out.fillerCount / mins;
   const txt = " " + words.join(" ") + " ", firstWords = words.slice(0, 5).join(" ");
   const opening = !/^(um|uh|so um|well|like|i guess|i dont know|i don't know|okay so|ok so)/.test(firstWords) && audio.startDelay < 5;
@@ -135,6 +175,7 @@ function analyze(text, dur, audio, node, passage) {
   out.sub = { Fillers: Math.round(fillPts) + "/30", Structure: Math.round(clamp(structure, 0, 30)) + "/30", Pace: Math.round(pacePts(20)) + "/20", Pauses: Math.round(pausePts(10)) + "/10", Time: Math.round(timePts) + "/10" };
   out.score = Math.round(clamp(fillPts + clamp(structure, 0, 30) + pacePts(20) + pausePts(10) + timePts, 0, 100));
   if (isPause) out.score = Math.round(clamp(fillPts * 1.8 + pausePts(10) * 1.5 + pacePts(15) + timePts * 0.6 + (out.repeats ? 0 : 5), 0, 100));
+  out.frame = frameReview(words, out, audio, opening, close);
   if (out.fpm <= 1) out.good.push("Very few filler words. Keep replacing them with pauses."); else out.tips.push(`About ${out.fpm.toFixed(1)} filler words per minute. When you feel one coming, close your mouth for one beat instead.`);
   if (out.repeats > 1) out.tips.push(`You repeated a word ${out.repeats} times (such as "I I" or "the the"). Finish the thought in your head before you start the sentence.`);
   if (!opening) out.tips.push(audio.startDelay >= 5 ? "You took a long time to begin. Start with your main point within a couple of seconds." : "Your opening started with a filler or a hedge. Start with your point: 'I believe...' or 'The key issue is...'.");
@@ -307,6 +348,7 @@ function resultView(head) {
   return `${head}<div class="stack"><div class="card stack center">${ring}<h2>${completes ? (stars === 3 ? "Excellent" : stars === 2 ? "Strong work" : "Lesson complete") : "Almost there"}</h2><div class="stars" style="font-size:22px;height:auto">${"★".repeat(stars)}${"☆".repeat(3 - stars)}</div>${L.msg ? `<div class="banner">${ico("flame")}<div>${esc(L.msg)}</div></div>` : ""}${completes ? "" : `<p class="muted">Speak for at least ${fmt(Math.round((n.targetSec || 30) * 0.6))} to complete this lesson.</p>`}</div>
   <div class="sub"><div class="stat"><b>${fmt(r.dur)}</b><span>Time</span></div><div class="stat"><b>${a.hasText ? a.wpm : "–"}</b><span>Words / min</span></div><div class="stat"><b>${a.pauses}</b><span>Pauses${a.longest ? ` (longest ${a.longest.toFixed(1)}s)` : ""}</span></div><div class="stat"><b>${a.fpm != null ? a.fpm.toFixed(1) : a.accuracy != null ? Math.round(a.accuracy * 100) + "%" : "–"}</b><span>${a.fpm != null ? "Fillers / min" : "Accuracy"}</span></div></div>
   ${Object.keys(a.sub).length ? `<div class="card stack"><h3>Score breakdown</h3><div class="row" style="flex-wrap:wrap">${Object.entries(a.sub).map(([k, v]) => `<span class="badge">${k} ${v}</span>`).join("")}</div>${fillers}</div>` : ""}
+  ${frameCard(a)}
   ${a.good.length ? `<div class="card soft stack"><h3>What worked</h3><ul class="tips">${a.good.map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>` : ""}
   ${a.tips.length ? `<div class="card stack"><h3>Work on next</h3><ul class="tips">${a.tips.slice(0, 4).map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>` : ""}
   ${aiCard(L, a)}
@@ -369,13 +411,23 @@ function finishLesson() {
   if (L.completes) {
     const p = S.progress[n.id] || (S.progress[n.id] = { attempts: 0 }); const stars = a.score == null ? 1 : a.score >= 85 ? 3 : a.score >= 70 ? 2 : a.score >= 50 ? 1 : 0;
     p.done = true; p.attempts += 1; p.best = Math.max(p.best || 0, a.score || 0); p.stars = Math.max(p.stars || 0, stars);
-    S.history.push({ ts: Date.now(), title: n.title, kind: n.kind, score: a.score, fpm: a.fpm != null ? +a.fpm.toFixed(2) : null, wpm: a.wpm, dur: Math.round(L.res.dur) }); S.history = S.history.slice(-200);
+    S.history.push({ ts: Date.now(), title: n.title, kind: n.kind, score: a.score, fpm: a.fpm != null ? +a.fpm.toFixed(2) : null, auth: a.frame ? a.frame.auth : null, fr: a.frame ? a.frame.fr : null, wpm: a.wpm, dur: Math.round(L.res.dur) }); S.history = S.history.slice(-200);
   }
   save(); stopAll(); V.lesson = null; render(); window.scrollTo(0, 0);
 }
 
 /* ---------- AI coaching (your own API key, called straight from this device) ---------- */
 const AI_DEFAULT = { gemini: "gemini-2.5-flash", claude: "claude-sonnet-4-5" };
+function frameCard(a) {
+  const f = a.frame; if (!f) return "";
+  const sig = [["hedge", "softeners"], ["tag", "tag questions"], ["apology", "apologies"]].map(([k, l]) => f.seen[k] ? `<span class="tag">${l} ×${f.seen[k]}</span>` : "").join("") + (f.decisive ? `<span class="tag ok">decisive phrases ×${f.decisive}</span>` : "");
+  return `<div class="card stack"><h3>Sentence framing and authority</h3>
+  <div class="sub"><div class="stat"><b>${f.auth}</b><span>Authority: ${esc(f.label)}</span></div><div class="stat"><b>${f.fr}</b><span>Sentence framing</span></div></div>
+  ${sig ? `<div>${sig}</div>` : '<span class="tag ok">No softeners or apologies found</span>'}
+  ${f.reframes.length ? `<div class="stack"><b>Say it this way instead</b>${f.reframes.map(r => `<div class="fw"><em>You said: "${esc(r.said)}"</em><span><b>Try:</b> "${esc(r.better)}"</span></div>`).join("")}</div>` : ""}
+  <div class="stack"><b>How to sound more authoritative</b><ul class="tips">${f.pointers.map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>
+  <p class="small muted">Based on your words and pauses. Tone of voice and body language are not scored.</p></div>`;
+}
 function aiCard(L, a) {
   if (!a.hasText) return "";
   if (L.ai) {
@@ -383,6 +435,8 @@ function aiCard(L, a) {
     return `<div class="card stack"><h3>AI coach</h3><p>${esc(x.summary || "")}</p>
     ${x.strengths && x.strengths.length ? `<div class="fw"><b>What worked</b><ul class="tips">${li(x.strengths)}</ul></div>` : ""}
     ${x.improvements && x.improvements.length ? `<div class="stack"><b>Improve next</b>${x.improvements.map(i => `<div class="fw"><b>${esc(i.focus || "")}</b><span>${esc(i.advice || "")}</span>${i.before ? `<em>You said: "${esc(i.before)}"</em>` : ""}${i.after ? `<span><b>Try:</b> "${esc(i.after)}"</span>` : ""}</div>`).join("")}</div>` : ""}
+    ${x.authority ? `<div class="fw"><b>Authority: ${esc(x.authority.rating || "")}</b><span>${esc(x.authority.why || "")}</span>${x.authority.pointers && x.authority.pointers.length ? `<ul class="tips">${li(x.authority.pointers)}</ul>` : ""}</div>` : ""}
+    ${x.framing && x.framing.length ? `<div class="stack"><b>Better sentence framing</b>${x.framing.map(i => `<div class="fw"><em>You said: "${esc(i.original || "")}"</em><span><b>Try:</b> "${esc(i.better || "")}"</span><span class="small muted">${esc(i.why || "")}</span></div>`).join("")}</div>` : ""}
     ${x.rewrite ? `<div class="fw"><b>A tighter version of your answer</b><span>${esc(x.rewrite)}</span></div>` : ""}
     ${x.next_drill ? `<p><b>Next drill:</b> ${esc(x.next_drill)}</p>` : ""}</div>`;
   }
@@ -397,7 +451,7 @@ function aiPrompt(L, a) {
 Transcript of what they said (speech recognition, so punctuation and some "um"s are missing): "${r.text}"
 Measured: ${Math.round(r.dur)} seconds, ${a.wpm} words per minute, ${a.pauses} pauses, ${a.fillerCount != null ? a.fillerCount + " filler words or repeats" : "reading accuracy " + Math.round((a.accuracy || 0) * 100) + "%"}.
 Coach only on what the transcript shows. Be specific and quote their words. Do not invent things they did not say. Plain language, no em dashes.
-Reply with JSON only, in this shape: {"summary": "2 sentences", "strengths": ["1 to 2 items"], "improvements": [{"focus": "short label", "advice": "one concrete step", "before": "short quote from them", "after": "better wording"}], "rewrite": "a tighter version of their answer in at most 4 sentences (empty string for read-aloud exercises)", "next_drill": "one small drill for tomorrow"}. Give at most 3 improvements.`;
+Reply with JSON only, in this shape: {"summary": "2 sentences", "strengths": ["1 to 2 items"], "improvements": [{"focus": "short label", "advice": "one concrete step", "before": "short quote from them", "after": "better wording"}], "authority": {"rating": "authoritative or mixed or tentative", "why": "1 to 2 sentences about how authoritative they sound and why", "pointers": ["up to 3 concrete ways to sound more authoritative"]}, "framing": [{"original": "a weakly framed sentence quoted from them", "better": "a stronger framing", "why": "short reason"}], "rewrite": "a tighter version of their answer in at most 4 sentences (empty string for read-aloud exercises)", "next_drill": "one small drill for tomorrow"}. Give at most 3 improvements and at most 3 framing items.`;
 }
 async function aiCall(prompt) {
   const { provider, key } = S.ai, model = S.ai.model || AI_DEFAULT[provider];
@@ -422,14 +476,22 @@ async function getCoaching() {
 
 /* ---------- word meanings ---------- */
 const dictCache = {};
+const stems = w => [...new Set([w, w.replace(/ies$/, "y"), w.replace(/es$/, ""), w.replace(/s$/, ""), w.replace(/ed$/, ""), w.replace(/ed$/, "e"), w.replace(/ing$/, ""), w.replace(/ing$/, "e"), w.replace(/ly$/, "")])].filter(x => x.length > 2);
+async function getJSON(url) { const c = new AbortController(), t = setTimeout(() => c.abort(), 7000); try { const r = await fetch(url, { signal: c.signal }); if (!r.ok) throw new Error("none"); return await r.json(); } finally { clearTimeout(t); } }
+async function lookup(w) {
+  for (const c of stems(w)) {
+    try { const j = await getJSON("https://api.dictionaryapi.dev/v2/entries/en/" + encodeURIComponent(c)); const out = j[0].meanings.slice(0, 2).map(m => `<b>${esc(m.partOfSpeech)}</b>: ${esc(m.definitions[0].definition)}`).join("<br><br>"); if (out) return out; } catch (e) { /* try next source */ }
+    try { const j = await getJSON("https://en.wiktionary.org/api/rest_v1/page/definition/" + encodeURIComponent(c)); const en = j.en || []; const out = en.slice(0, 2).map(m => `<b>${esc(m.partOfSpeech)}</b>: ${esc((m.definitions[0].definition || "").replace(/<[^>]*>/g, ""))}`).join("<br><br>"); if (out) return out; } catch (e) { /* try next word form */ }
+  }
+  return null;
+}
 async function showWord(w) {
-  const L = V.lesson, p = L && L.content.passage, g = p && p.gloss && p.gloss[w];
-  openSheet(`<h2>${esc(w)}</h2><p id="def" class="muted">${g ? esc(g) : "Looking up..."}</p><button class="btn" data-act="sheet-close">Got it</button>`);
-  if (g) return;
-  try {
-    if (!dictCache[w]) { const r = await fetch("https://api.dictionaryapi.dev/v2/entries/en/" + encodeURIComponent(w)); if (!r.ok) throw new Error("none"); const j = await r.json(); dictCache[w] = j[0].meanings.slice(0, 2).map(m => `<b>${esc(m.partOfSpeech)}</b>: ${esc(m.definitions[0].definition)}`).join("<br><br>"); }
-    const d = $("#def"); if (d) d.innerHTML = dictCache[w];
-  } catch (e) { const d = $("#def"); if (d) d.textContent = "No definition found offline. Try searching for this word online."; }
+  const L = V.lesson, p = L && L.content.passage, built = (p && p.gloss && p.gloss[w]) || GLOSS_EXTRA[w] || GLOSS_EXTRA[w.replace(/s$/, "")];
+  openSheet(`<h2>${esc(w)}</h2><p id="def" class="muted">${built ? esc(built) : "Looking up..."}</p><button class="btn" data-act="sheet-close">Got it</button>`);
+  if (built) return;
+  if (dictCache[w] === undefined) dictCache[w] = await lookup(w);
+  const d = $("#def"); if (!d) return;
+  if (dictCache[w]) d.innerHTML = dictCache[w]; else { delete dictCache[w]; d.innerHTML = `Could not load a definition. Check your connection, or <a href="https://www.google.com/search?q=define+${encodeURIComponent(w)}" target="_blank" rel="noopener">search for it online</a>.`; }
 }
 function openSheet(html) { const s = $("#sheet"); s.innerHTML = `<div role="dialog" aria-modal="true">${html}</div>`; s.hidden = false; }
 function closeSheet() { $("#sheet").hidden = true; }
